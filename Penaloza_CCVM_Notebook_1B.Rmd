@@ -34,7 +34,7 @@ This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook for Supplemental 
 library(data.table)       # Efficient data handling
 library(edgeR)            # Normalzing counts to TMM
 library(WGCNA)            # Network analysis
-library(RCy3)             # Cytoscape connectivity
+#library(RCy3)             # Cytoscape connectivity
 library(tidyr)            # Data tidying
 library(stringr)          # String manipulation
 library(readr)            # Fast, efficient CSV reading into tibbles
@@ -66,6 +66,15 @@ library(knitr)            # For creating tables in R Markdown
 library(here)             # File path management
 library(foreach)          # Enables loop parallelization and iteration in R
 library(doParallel)       # Registers parallel backend for parallel computing
+library(rtracklayer)
+#library(devtools)
+library(propr)
+library(tximport)
+
+# This doesn't work
+#install.packages("propr/propr_4.2.6.tar.gz", repos = NULL, type = "source")
+
+
 
 # Set global options
 options(stringsAsFactors = FALSE)  # Set stringsAsFactors to FALSE globally - recommended for WGCNA
@@ -110,7 +119,7 @@ Note: ERS2510278 is mislabelled "5911sTS.Human.KidneyTestis.4w.Male" - it is a k
 
 ```{r Import Metadata}
 # Specify the data directory and file path
-dir_path <- "PublicData"
+dir_path <- "InputData"
 
 # Define the file path
 file_path <- file.path(dir_path, "E-MTAB-6814.sdrf.txt")
@@ -118,7 +127,7 @@ file_path <- file.path(dir_path, "E-MTAB-6814.sdrf.txt")
 # Read the CSV file, select specific columns, and rename them
 TPM_metadata <- read_tsv(file_path, show_col_types = FALSE, col_select = c(
   `Source Name`,
-  `Comment[ENA_SAMPLE]`,
+  `Comment[ENA_RUN]`,
   `Characteristics[individual]`,
   `Characteristics[developmental stage]`,
   `Characteristics[age]`,
@@ -128,7 +137,7 @@ TPM_metadata <- read_tsv(file_path, show_col_types = FALSE, col_select = c(
 )) %>%
   rename(
     Name = `Source Name`,
-    Sample = `Comment[ENA_SAMPLE]`,
+    Sample = `Comment[ENA_RUN]`,
     Donor = `Characteristics[individual]`,
     Stage = `Characteristics[developmental stage]`,
     Age = `Characteristics[age]`,
@@ -175,8 +184,15 @@ TPM_metadata <- TPM_metadata %>%
     Stage = factor(Stage, levels = stage_order)  # Convert Stage to a factor with the correct order
   )
 
+# Get library as a column
+TPM_metadata <- TPM_metadata %>%
+  mutate(Identifier = str_extract(Name, "^[^sTS]+"))
+
 # Glimpse the data to verify
 glimpse(TPM_metadata)
+
+
+rm(dir_path, stage_order, file_path)
 ```
 
 In the the developmental time series experiment (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6658352/), the human prenatal brain was divided into two regions: forebrain together with the midbrain (referred to as the ‘brain’) and hindbrain (referred to as the ‘cerebellum’). Human postnatal ‘brain’ and ‘cerebellum’ samples comprise the dorsolateral prefrontal region of the cerebral cortex and lateral cerebellar cortex, respectively. 
@@ -203,7 +219,41 @@ TPM_metadata <- TPM_metadata %>%
 
 # View the metadata
 style_kable(TPM_metadata[1:10,], caption="Multi-organ RNA-seq Metadata")
+
+rm(organ_order)
 ```
+
+
+Remove the replicates that they don't use in the paper. I need to read in Supplementary Table2. Also remove samples with high ribo content (>10%)
+
+```{r}
+# Specify the data directory and file path
+dir_path <- "InputData"
+
+# Define the file path
+file_path <- file.path(dir_path, "SuppTable2.csv")
+
+# Read the CSV file, select specific columns, and rename them
+SuppTable2 <- read_csv(file_path, show_col_types = FALSE)
+
+used_library <- SuppTable2 %>%
+  filter(`Used library?` == "Yes") %>%
+  pull("library ID") %>%
+  as.list()
+
+
+TPM_metadata <- TPM_metadata %>%
+  filter(Identifier %in% used_library)
+
+
+libraries_with_high_ribo <- c("5571", "5569", "6100")
+TPM_metadata <- TPM_metadata %>%
+  filter(!(Identifier %in% libraries_with_high_ribo))
+
+
+rm(SuppTable2, used_library, libraries_with_high_ribo, dir_path, file_path)
+```
+
 
 Display summaries of the dataset. 
 
@@ -233,86 +283,329 @@ summary_metadata_stage <- TPM_metadata %>%
 # Display the counts as a table
 style_kable(summary_metadata_organ, caption = "Developmental time series counts by organ")
 style_kable(summary_metadata_stage, caption = "Developmental time series counts by development stage")
+
+rm(summary_metadata_organ, summary_metadata_stage)
 ```
 
-## Read in normalized expression levels
+## Read in gene counts
 
-Normalized expression levels of lncRNAs calculated from this time series, expressed as transcripts per million (TPM), were obtained from the publicly accessible LncExpDB database (available at lncRNA Expression Database).
+Gene counts were calculated with salmon using the nextflow pipeline. Results were written here and aggregated to one file with all samples: /igm/projects/Audrey_lncRNA/results-ribo/salmon/
+Aggregated results have been copied to the InputData folder.
 
->Li Z, Liu L, Jiang S, Li Q, Feng C, Du Q, Zou D, Xiao J, Zhang Z, Ma L. LncExpDB: an expression database of human long non-coding RNAs. Nucleic Acids Res. 2021 Jan 8;49(D1):D962-D968. doi: 10.1093/nar/gkaa850. PMID: 33045751; PMCID: PMC7778919.
-
-https://ngdc.cncb.ac.cn/lncexpdb/downloads
-
-ftp://download.big.ac.cn/lncexpdb/2-OrganDevelopment/1-E-MTAB-6814//expression_profiles_E-MTAB-6814.tar.gz
-
-TPM normalized data for the developmental time series was extracted from the expression level file above and renamed `lncExpDB_E-MTABGeneTPM.tsv` in the `PublicData` folder. This script reads in a matrix of Transcripts Per Million (TPM) values from a TSV file, processes the data to ensure the column headers are correctly formatted, and converts the data into a tibble for easier manipulation in R.
 
 ```{r Read in lncExpDB resource}
 # Specify the data directory and file path
-dir_path <- "PublicData"
+dir_path <- "InputData"
 
-# Ream in TPM data and fix column header
-TPM <- read_tsv(
-  file.path(dir_path, "lncExpDB_E-MTABGeneTPM.tsv"),
+# Read in gene count data and fix column header
+gene_counts <- read_tsv(
+  file.path(dir_path, "salmon.merged.gene_counts.tsv"),
   show_col_types = FALSE
 )
-names(TPM)[1] <- "gene_id"
 
-# Reorder the columns in TPM to match the order of samples
+names(gene_counts)[1] <- "ENSG_ID"
+
+# Reorder the columns in gene_counts to match the order of samples
 # Select gene_id first, then reorder the remaining columns based on sample_order
-TPM <- TPM %>%
-  dplyr::select(gene_id, all_of(TPM_metadata$Sample))
+gene_counts <- gene_counts %>%
+  dplyr::select(ENSG_ID, all_of(TPM_metadata$Sample))
 
 # Create a gene type column, indicating whether the gene is a lncRNA or a protein coding gene
-TPM <- TPM %>%
-  mutate(gene_type = ifelse(grepl("^HSALNG", gene_id), "lncRNA", "protein")) %>%
-  dplyr::select(gene_id, gene_type, everything())
+gtf <- import('/igm/projects/Audrey_lncRNA/data/nextflow_input/gencode.v47.annotation.gtf.gz')
+genes <- as.data.frame(gtf[gtf$type == "gene", c("gene_id", "gene_type")])
+gene_counts$gene_type <- genes$gene_type[match(gene_counts$ENSG_ID, genes$gene_id)]
+gene_counts <- gene_counts %>%
+  dplyr::select(ENSG_ID, gene_type, everything())
+
 
 # Summarize gene types
-summary_tpm_gene <- TPM %>%
+summary_tpm_gene <- gene_counts %>%
   group_by(gene_type) %>%
   summarise(Count = n(), .groups = 'drop') %>%
   arrange(desc(Count)) %>%
   # Use tibble::add_row() to append a total row with the sum of counts
   add_row(gene_type = "Total", Count = sum(.$Count))
-style_kable(summary_tpm_gene, caption = "Genes by type in TPM matrix")
+style_kable(summary_tpm_gene, caption = "Genes by type")
 
 # Display the first few rows of the CCVM data as a nicely formatted table
-style_kable(TPM[1:5,1:10], caption = "Summary of the first few rows of the RNA-seq data")
+style_kable(gene_counts[1:5, c(1, 3, 4, 5, 6, 7)], caption = "Summary of the first few rows of the RNA-seq data")
+
+rm(gtf, summary_tpm_gene)
 ```
+
+
+Just keep protein coding and lncRNA genes
+
+```{r}
+gene_counts <- subset(gene_counts, gene_type %in% c("protein_coding", "lncRNA"))
+```
+
+At this point, if doing proportions rather than correlations, switch to calculating proportions in the R script. This requires more memory and time so it cannot be done in the notebook.
+
+Here are some code scraps I use to format the data properly before submitting
+
+```{r}
+counts <- gene_counts[, -c(1, 2)]
+counts <- as.data.frame(t(counts))
+colnames(counts) <- gene_counts$ENSG_ID
+
+# Dynamic filtering
+keep <- colSums(counts >= 10) >= 10  # Features with at least 10 counts in at least 10 samples
+filtered_indices <- which(keep)
+filtered_indices <- unname(filtered_indices)
+
+counts <- as.matrix(counts)
+```
+
+
+```{r}
+pr <- propr(
+  counts,  # rows as samples, like it should be
+  metric = "pcor.bshrink",  # partial correlation without shrinkage "pcor" is also available
+  ivar = "clr",  # "clr" is recommended
+  p = 100
+) 
+```
+
+```{r}
+
+if (length(select) == 1 && is.na(select)) {
+  # Do nothing (no output, no return value)
+  invisible(NULL)
+} else if (is.vector(select) && length(select) > 0) {
+  message("Alert: Using 'select' may make permutation testing unreliable.")
+  counts_new <- counts[, select, drop = FALSE]
+} else {
+  stop("Error: 'select' must be NA or a vector of indices.")
+}
+```
+
+
+
+
+Proceed to next step for calculating correlations.
+
+At this point we are following the steps in the paper describing the best way to process input data for network analysis
+    1. If gene counts are available, use CTF or CUF to normalize the data. They consistently give the best performance regardless of various factors. Between the two, CTF seems to be slightly more consistent in yielding top performance. Even though no normalization (Counts) leads to good performance in our study, applying the additional normalization step is prudent to ensure robustness against variabilities specific to a new dataset.
+
+    2. If data is only available after within-sample normalization, use TPM for coexpression analysis. Data in CPM and RPKM units can be easily converted to TPM. TPM outperforms CPM and RPKM and yields consistently reasonable performance.
+
+    3. After normalization, perform log transformation (using asinh) and calculate coexpression using Pearson correlation coefficient.
+
+    4. If the dataset has greater than 40 samples, use CLR to transform the pairwise gene correlations. CLR may also help certain cases where the main interest is interactions that are specific to a given tissue.
+
+
+
+0. exclude genes that did not reach a minimum of 10 reads in at least 3 libraries
+
+```{r}
+gene_counts_input <- gene_counts[, -2]
+gene_counts_input <- gene_counts_input %>%
+  column_to_rownames(var = names(gene_counts_input)[1]) %>%  # Use the first column as row names
+  dplyr::select(-1)   
+keep_genes <- rownames(gene_counts_input)[rowSums(gene_counts_input >= 10) >= 3]
+gene_counts_input <- gene_counts_input[rownames(gene_counts_input) %in% keep_genes, ]
+
+rm(keep_genes)
+```
+
+
+1. Get CTF values
+
+```{r}
+
+dge <- DGEList(counts = gene_counts_input)
+
+dge <- calcNormFactors(dge, method = "TMM")
+
+# View normalization factors
+print(dge$samples$norm.factors)
+
+# Compute TMM-normalized counts
+ctf <- cpm(dge, normalized.lib.sizes = TRUE)
+ctf <- as.data.frame(ctf)
+
+rm(dge)
+```
+
+2. log transform and calculate correlations
+
+```{r}
+# Perform asinh transformation
+log_ctf <- asinh(ctf)
+
+# Calculate Pearson correlation matrix (genes vs genes)
+#cor_matrix <- cor(t(log_ctf), method = "pearson")
+
+```
+
+
+Option to do deseq2 vst transformation. This was for input to the PCA. Don't do this for the WGCNA.
+
+```{r}
+sample_info <- TPM_metadata %>%
+  dplyr::filter(Sample %in% colnames(gene_counts_input)) %>%
+  dplyr::select(Sample, Stage, Age, Organ, Identifier) %>%
+  column_to_rownames(var = "Sample") 
+
+counts_matrix <- as.matrix(gene_counts_input)
+counts_matrix <- round(counts_matrix)
+
+# Check for non-integers to ensure all are properly rounded
+any(counts_matrix %% 1 != 0)  # Should return FALSE
+
+
+#dir_path <- "/igm/projects/Audrey_lncRNA/results-ribo/salmon"
+#files <- file.path(dir_path, rownames(sample_info), "quant.genes.sf")
+#names(files) <- rownames(sample_info)  # Use sample names as names for the files
+
+#txi <- tximport(files, type = "salmon", txIn=FALSE, geneIdCol = "Name")
+
+#for (file in files) {
+#    dat <- vroom(file)
+#    print(problems(dat))
+#}
+
+
+# Create the DESeqDataSet
+dds <- DESeqDataSetFromMatrix(
+    countData = counts_matrix,
+    colData = sample_info,
+    design = ~ Organ
+)
+
+# Doesn't use condition so it doesn't matter what it is
+vst_data <- vst(dds, blind = TRUE)
+
+vst_matrix <- assay(vst_data)
+
+vst_df <- as.data.frame(t(vst_matrix))
+vst_df$Sample <- rownames(vst_df) 
+
+vst_df <- vst_df %>%
+  left_join(TPM_metadata %>% 
+    dplyr::select(Sample, Age, Organ, Identifier), by = "Sample") %>%
+  relocate(Sample, Age, Organ, Identifier, .before = everything())
+
+
+
+
+```
+
+
+```{r}
+# do pca in R
+pca_result <- prcomp(t(vst_matrix), scale. = TRUE)
+
+# Convert PCA results to a data frame
+pca_data <- as.data.frame(pca_result$x)
+pca_data$Sample <- rownames(pca_data)  # Add sample names as a column
+
+# Merge with metadata
+pca_plot_data <- pca_data %>%
+  left_join(TPM_metadata, by = "Sample")
+
+pca_plot_data$Stage_numeric <- as.numeric(pca_plot_data$Stage)
+
+min_val <- 0.5  # Desired minimum value
+max_val <- 2.5 # Desired maximum value
+
+pca_plot_data$Stage_scaled <- ((pca_plot_data$Stage_numeric - min(pca_plot_data$Stage_numeric, na.rm = TRUE)) /
+                                (max(pca_plot_data$Stage_numeric, na.rm = TRUE) - min(pca_plot_data$Stage_numeric, na.rm = TRUE))) *
+                                (max_val - min_val) + min_val
+
+#custom_palette <- adjustcolor(c(
+#  "cerebellum" = "#33cbff",
+#  "brain" = "#3197ca",
+#  "heart" = "#cb0200",
+#  "liver" = "#329800",
+#  "kidney" = "#cb9801",
+#  "ovary" = "#cb3398",
+#  "testis" = "#ff6600"
+#), alpha.f = 0.8)
+
+custom_palette <- c(
+  "cerebellum" = "#33cbff",
+  "brain" = "#3197ca",
+  "heart" = "#cb0200",
+  "liver" = "#329800",
+  "kidney" = "#cb9801",
+  "ovary" = "#cb3398",
+  "testis" = "#ff6600"
+)
+
+# Create the PCA plot
+ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Organ, size=Stage_scaled)) +
+  geom_point(alpha = 0.8) +
+  scale_size_identity() +
+  scale_color_manual(values = custom_palette,
+                     guide = guide_legend(override.aes = list(alpha = 0.8))) +
+  theme_minimal() +
+  labs(
+    title = "PCA Plot",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Organ Type",
+    size = "Developmental Stage"
+  ) +
+  theme(legend.position = "right")
+
+
+
+# Create the PCA plot
+ggplot(pca_plot_data, aes(x = PC1, y = PC3, color = Organ, size=Stage_scaled)) +
+  geom_point(alpha = 0.8) +
+  scale_size_identity() +
+  scale_color_manual(values = custom_palette,
+                     guide = guide_legend(override.aes = list(alpha = 0.8))) +
+  theme_minimal() +
+  labs(
+    title = "PCA Plot",
+    x = "Principal Component 1",
+    y = "Principal Component 3",
+    color = "Organ Type",
+    size = "Developmental Stage"
+  ) +
+  theme(legend.position = "top")
+
+
+```
+
+```{r}
+# Variance explained by each principal component
+pca_variance <- (pca_result$sdev)^2
+explained_variance <- pca_variance / sum(pca_variance)
+
+scree_data <- data.frame(
+  PC = seq_along(explained_variance),         # Principal component index
+  Variance = explained_variance * 100         # Variance as percentage
+)
+
+scree_data <- scree_data[1:10, ]
+
+ggplot(scree_data, aes(x = PC, y = Variance)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black") +
+  geom_line(aes(group = 1), color = "black") +
+  geom_point(color = "black", size = 3) +
+  theme_minimal() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Variance Explained (%)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+
 
 
 ## Data preprocessing
 
 This script removes rows where the maximum gene expression is less than 1 across all samples, using the apply() function to calculate the maximum expression for each gene and then filter out those rows. A threshold of a TPM value of 1 is typically employed in RNA-seq analysis.
 
-```{r}
-# Function to filter TPM data and log the number of genes removed
-filter_low_expression_genes <- function(TPM_data, threshold = 1, samples = NULL) {
-  
-  # If specific samples are provided, filter the data to include only those samples
-  if (!is.null(samples)) {
-    filtered_TPM_data <- TPM_data %>% dplyr::select(gene_id, all_of(samples))
-  } else {
-    filtered_TPM_data <- TPM_data
-  }
-  
-  # Calculate the maximum expression for each gene across the selected samples
-  max_expression <- apply(filtered_TPM_data[ , -c(1:2)], 1, max)  # Exclude the first two columns (gene_id and gene_type)
-  
-  # Identify genes to remove (those with max expression < threshold)
-  genes_to_remove <- sum(max_expression < threshold)
-  
-  # Filter the TPM data to keep only genes with max expression >= threshold
-  filtered_TPM <- TPM_data[max_expression >= threshold, ]
-  
-  # Log the number of genes removed
-  logMessage(paste0(genes_to_remove, " genes were removed due to low expression (max < ", threshold, ")."))
-  logMessage(paste0(nrow(filtered_TPM), " genes remain."))
-  
-  return(filtered_TPM)
-}
-```
 
 As in Lu et al, 2023, we will filter the TPM values to only include the genes that are expressed in the heart (i.e., for any given gene, an expression value >=1 in any of the 50 heart samples is required).
 
@@ -322,233 +615,19 @@ heart_samples <- TPM_metadata %>%
   filter(Organ == "heart") %>%
   pull(Sample)
 
-# Create list of lncRNA coding genes
-TPM_lnc <- TPM %>%
-  filter(gene_type == "lncRNA")
+heart_samples <- intersect(heart_samples, colnames(log_ctf))
 
-# Create a list of TPM values filtered for lncRNA expression in any tissue
-TPM_lnc_filtered_all <- filter_low_expression_genes(TPM_lnc)  
 
-# Create a list of TPM values filtered for lncRNA expression in the heart
-TPM_lnc_filtered <- filter_low_expression_genes(TPM_lnc_filtered_all,
-                                                samples = heart_samples)
+# Create a list of values filtered for lncRNA expression in the heart
+# We can pick this cutoff based on the pre-log transformed ctf and then apply it to the post transformed.
+subset_df <- ctf[, heart_samples]
+no_high_expression <- rowSums(subset_df > 1) > 0
+ctf_filtered_heart <- log_ctf[no_high_expression, ]
 
-# Create list of protein coding genes, expressed in ANY tissue
-TPM_prot <- TPM %>%
-  filter(gene_type == "protein")
-TPM_prot_filtered <- filter_low_expression_genes(TPM_prot)
-
-# Count lncRNA and protein-coding genes
-lncRNA_count <- sum(str_detect(TPM_lnc_filtered$gene_id, "^HSALNG"))
-protein_coding_count <- sum(str_detect(TPM_prot_filtered$gene_id, "^ENSG"))
-logMessage(paste0("Remaining lncRNA genes expressed in the heart: ", lncRNA_count))
-logMessage(paste0("Remaining protein-coding genes expressed in any tissue: ", protein_coding_count))
+rm(ctf, subset_df, log_ctf)
 ```
 
 
-# CNV data
-
-Read in the final CCVM CNV table with lncRNAs from Script 1A. The islated CHD CNV data frame (`CNV_iso`) contains all the CNVs that contain lncRNAs is a column called "lncRNA_genes". There may be a single gene, or many genes in a list delimted with "; ", i.e., "HSALNG0122847; HSALNG0122849; HSALNG0122850".
-
-```{r}
-# Read in RDS data frame from script 1A
-CNV_iso <- readRDS("Results/Penaloza_lncRNA_CCVM_hg38_liftover.rds")
-style_kable(head(CNV_iso, 1),caption="Final CNV table")
-CNV_lncRNA_count <- sum(CNV_iso$lncRNA_count != 0)
-CNV_no_lncRNA_count <- sum(CNV_iso$lncRNA_count == 0)
-logMessage(paste0("CNV-lncRNA regions: ", CNV_lncRNA_count))
-logMessage(paste0("CNVs without lncRNA: ", CNV_no_lncRNA_count))
-
-# Split the lncRNA_genes column into individual lncRNA genes
-CNV_LNC <- CNV_iso %>%
-  # Separate lncRNA genes into individual rows
-  separate_rows(lncRNA_genes, sep = "; ") %>%
-  # Filter out any NA values
-  filter(!is.na(lncRNA_genes)) %>%
-  # Pull out the lncRNA genes into a vector
-  pull(lncRNA_genes)
-CNV_LNC_distinct <- unique(CNV_LNC)
-
-# Print the counts of total and unique CNV-lncRNAs
-logMessage(paste0("There are ", length(CNV_LNC), " CNV-lncRNAs, consisting of ",
-                  length(CNV_LNC_distinct), " total unique lncRNAs"))
-```
-
-Filter the TPM_lnc_filtered dataset to only include the lncRNAs that are impacted by a CNV (i.e., those that are present in the CNV_LNC_distinct list)
-
-```{r}
-# Filter the TPM_lnc_filtered to include only lncRNAs impacted by a CNV
-TPM_lnc_CNV_filtered <- TPM_lnc_filtered %>%
-  filter(gene_id %in% CNV_LNC_distinct)
-
-# Display the filtered dataset
-logMessage(paste0("Of the ", nrow(TPM_lnc_filtered), " lncRNAs expressed in the heart, ",
-                  nrow(TPM_lnc_CNV_filtered), " are impacted by a CNV."))
-
-# Merge the final TPM data
-TPM_filtered <- bind_rows(TPM_lnc_CNV_filtered, TPM_prot_filtered)
-logMessage(paste0("The final gene set consisted of ",
-                  format(nrow(TPM_filtered), big.mark = ","), " total gene, of which ",
-                  format(sum(TPM_filtered$gene_type == "lncRNA"), big.mark = ","), " are lncRNAs and ",
-                  format(sum(TPM_filtered$gene_type == "protein"), big.mark = ","), 
-                  " are protein coding genes."))
-```
-
-## Final summary of expressed CNV-lncRNA
-
-Add columns to CNV data for expressed lncRNAs. Create table of summary merics. 
-
-```{r}
-# Function to filter lncRNA genes within a CNV
-filter_CNV_lncRNAs <- function(lncRNA_list, expressed_lncRNAs) {
-  # Split the delimited list into individual lncRNAs
-  lncRNA_vector <- unlist(strsplit(lncRNA_list, "; "))
-  
-  # Filter the lncRNAs to include only those in the expressed list
-  matching_lncRNAs <- lncRNA_vector[lncRNA_vector %in% expressed_lncRNAs]
-  
-  # Return the matching lncRNAs as a delimited string and the count
-  list(
-    CNV_lncRNA_genes = paste(matching_lncRNAs, collapse = "; "),
-    CNV_lncRNA_count = length(matching_lncRNAs)
-  )
-}
-
-# Apply the function to each row in the CNV_iso data table
-CNV_iso <- CNV_iso %>%
-  rowwise() %>%
-  mutate(
-    result = list(filter_CNV_lncRNAs(lncRNA_genes, TPM_lnc_CNV_filtered$gene_id)),
-    expressed_lncRNA_genes = result$CNV_lncRNA_genes,
-    expressed_lncRNA_count = result$CNV_lncRNA_count
-  ) %>%
-  dplyr::select(-result)  # Remove the temporary 'result' column
-
-# Save the tibble as a tab-delimited text file
-write_delim(CNV_iso, "Results/Penaloza_expressed_lncRNA_CCVM_hg38_liftover.txt", delim = "\t")
-
-# Save the tibble to an RDS file
-saveRDS(CNV_iso, file = "Results/Penaloza_expressed_lncRNA_CCVM_hg38_liftover.rds")
-
-# Calculate some summary metrics
-num_cnvs <- nrow(CNV_iso)
-unique_expressed_lncrna_gene_count <- length(unique(
-  unlist(strsplit(CNV_iso$expressed_lncRNA_genes, ";\\s*"))))
-
-# Create the summary tibble using rbind
-summary_final_data <- rbind(
-  tibble(Metric = "Patients", 
-         Count = length(unique(CNV_iso$ID))),
-  tibble(Metric = "CNVs", 
-         Count = length(unique(CNV_iso$INDEX))),
-  tibble(Metric = "Patients with CNVs without expressed lncRNAs", 
-         Count = length(unique(CNV_iso$ID[CNV_iso$expressed_lncRNA_count == 0]))),
-  tibble(Metric = "CNVs without expressed lncRNAs", 
-         Count = sum(CNV_iso$expressed_lncRNA_count == 0, na.rm = TRUE)),
-  tibble(Metric = "Patients with CNVs overlapping 1 or more expressed lncRNAs", 
-         Count = length(unique(CNV_iso$ID[CNV_iso$expressed_lncRNA_count > 0]))),
-  tibble(Metric = "CNVs overlapping 1 or more expressed lncRNAs",
-         Count = sum(CNV_iso$expressed_lncRNA_count>0, na.rm = TRUE)),
-  tibble(Metric = "Median number of expressed lncRNAs per CNV", 
-         Count = median(CNV_iso$expressed_lncRNA_count, na.rm = TRUE)),
-  tibble(Metric = "Mean number of expressed lncRNAs per CNV", 
-         Count = round(mean(CNV_iso$expressed_lncRNA_count, na.rm = TRUE),0)),
-  tibble(Metric = "IQR of expressed lncRNAs per CNV", 
-         Count = round(IQR(CNV_iso$expressed_lncRNA_count, na.rm = TRUE),0)),
-  tibble(Metric = "Maximum number of expressed lncRNAs in a CNV", 
-         Count = max(CNV_iso$expressed_lncRNA_count, na.rm = TRUE)),
-  tibble(Metric = "Number of unique expressed lncRNA genes", 
-         Count = format(unique_expressed_lncrna_gene_count, big.mark = ","))
-)
-
-# Print the transposed tibble
-style_kable(summary_final_data, 
-            caption ="Summary of Final CHD Cohort and impacted lncRNAs expressed in the heart")
-```
-
-## Plot the distribution of expressed lncRNAs within the CNVs.
-
-This script visualizes the distribution of expressed lncRNA counts within CNVs by creating a histogram (*Supplemental Firgure 4*). The lncRNA counts are first binned, with zero counts handled separately. A histogram is then generated, showing the frequency of CNVs with different numbers of overlapping lncRNAs. The plot is customized with specific colors, axis breaks, and styling to enhance readability. The final plot is saved as a high-quality PDF file and displayed within the R Markdown document.
-
-```{r Plot Intersection of CNV and lncRNA}
-# Create a histogram showing the distribution of lncRNA counts within CNVs
-FigS4 <- ggplot(CNV_iso, aes(x = expressed_lncRNA_count)) +
-  geom_histogram(binwidth = 5, boundary = 0.01, 
-                 color = "white", fill = "steelblue", alpha = 0.8) +  # Adjusted binwidth and colors
-  scale_y_continuous(expand = c(0, 0)) +  # Remove space between plot and axis
-  labs(
-    x = "Number of expressed lncRNAs per CNV",
-    y = "Frequency",
-    title = "Distribution of expressed lncRNAs within CNVs",
-  ) +
-  theme_minimal(base_size = 14) +  # Set a base size for all text
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold",
-                              size = 16, margin = margin(b = 10)),  # Center and bold title with margin
-    axis.title = element_text(size = 14, face = "bold"),
-    axis.text = element_text(size = 12),
-    axis.ticks = element_line(color = "black", linewidth = 0.5),  # Add tick marks
-    axis.ticks.length = unit(0.25, "cm"),  # Length of tick marks
-    panel.grid.major = element_blank(),  # Remove major gridlines
-    panel.grid.minor = element_blank(),  # Remove minor gridlines
-    panel.background = element_rect(fill = "white", colour = NA),
-    axis.line = element_line(color = "black", linewidth = 0.5),  # Use linewidth instead of size
-    plot.margin = unit(c(1, 1, 1, 1), "cm")  # Add margin around the plot
-  )
-
-# Save the plot as a high-quality PDF
-ggsave("Figures/Figure_S4_CNV_expressed_lncRNA_overlap_count_histogram.pdf", 
-       plot = FigS4,
-       width = 8.5, height = 6, units = "in", dpi = 300, device = cairo_pdf)
-
-# Display the histogram
-print(FigS4)
-```
-
->*Supplemental Figure 4: Distribution of Expressed lncRNA Counts Within CNVs.* This histogram illustrates the distribution of the number of expressed CNV-lncRNAs in the CCVM study cohort. Expression was determined by a TPM value >=1 in any of the 50 heart samples from the developmental time series RNA-seq data. CNVs are grouped into bins based on the number of overlapping lncRNAs, with zero counts handled separately. The x-axis represents the number of lncRNAs per CNV, while the y-axis shows the frequency of CNVs in each bin. The plot highlights the prevalence of CNVs with varying levels of lncRNA involvement
-
-## Venn diagram of expressed lncRNAs and CNV-lnRNA
-
-```{r}
-# Define lncRNA genes to create Venn diagram
-all_expressed_lncRNA <- TPM_lnc_filtered_all$gene_id  # Label: "Expressed lncRNAs"
-heart_expressed_lncRNA <- TPM_lnc_filtered$gene_id  # Label: "Heart lncRNAs"
-cnv_lncRNA <- CNV_LNC_distinct  # Label: "CNV lncRNAs"
-
-# Create the data for the Euler diagram
-venn_counts <- c(
-  "Expressed lncRNAs" = length(all_expressed_lncRNA),
-  "Heart lncRNAs" = length(heart_expressed_lncRNA),
-  "CNV lncRNAs" = length(cnv_lncRNA),
-  "Expressed lncRNAs&Heart lncRNAs" = length(heart_expressed_lncRNA),  # Heart is fully within Expressed
-  "Expressed lncRNAs&CNV lncRNAs" = length(intersect(all_expressed_lncRNA, cnv_lncRNA)),
-  "Heart lncRNAs&CNV lncRNAs" = length(intersect(heart_expressed_lncRNA, cnv_lncRNA)),
-  "Expressed lncRNAs&Heart lncRNAs&CNV lncRNAs" = length(intersect(heart_expressed_lncRNA, cnv_lncRNA))
-)
-
-fit <- euler(
-  venn_counts,
-  input = "union",
-  shape = "ellipse"
-)
-
-# Save the Venn diagram as a Cairo PDF
-cairo_pdf("Figures/Figure_2E_lncRNA_Venn_diagram.pdf", 
-    width = 8, height = 8)
-
-Fig2E <- plot(fit,
-     fills = list(fill = c("blue", "red", "green"), alpha = 0.6),
-     edges = list(col = "black"),
-     labels = list(font = 2),
-     quantities = TRUE)
-
-print(Fig2E)
-
-# Close the PDF device
-dev.off()
-```
-
->*Figure 2E. Venn diagram of expressed lncRNAs and CNV-associated lncRNAs.* This Venn diagram illustrates the overlap between three categories of long non-coding RNAs (lncRNAs) in the study cohort: expressed lncRNAs (blue), heart-expressed lncRNAs (red), and CNV-associated lncRNAs (green). The overlap regions indicate the number of lncRNAs shared between these categories, with heart-expressed lncRNAs being a subset of the total expressed lncRNAs. Quantities are displayed for each intersection, highlighting the relationship between CNV-associated lncRNAs and the lncRNAs expressed in the heart and across the entire dataset.
 
 # WGCNA analysis
 
@@ -570,49 +649,16 @@ Hyperbolic Arcsine (asinh) Transformation, asinh(x), is often used for RNA-seq d
 
 > Johnson KA, Krishnan A. Robust normalization and transformation techniques for constructing gene coexpression networks from RNA-seq data. Genome Biol. 2022 Jan 3;23(1):1. doi: 10.1186/s13059-021-02568-9. PMID: 34980209; PMCID: PMC8721966.
 
-```{r}
-# Define a function for the hyperbolic arcsine (asinh) transformation
-asinh_transform <- function(x) {
-  log(x + sqrt(x^2 + 1))
-}
 
-# Apply the asinh_transform function to all TPM value columns
-TPM_transformed <- TPM_filtered %>%
-  mutate(across(-c(gene_id, gene_type), asinh_transform))
-
-# Quick box plot to show the transformed TPM data
-TPM_transformed %>%
-  dplyr::select(1:10) %>%
-  pivot_longer(cols=-c(gene_id,gene_type),names_to="sample",values_to="TPM") %>%
-  dplyr::filter(TPM>1) %>%
-  ggplot(aes(x=sample,y=TPM)) +
-  ylab("asinh(TPM)") +
-  theme_bw() +
-  geom_boxplot()  + coord_flip()
-```
-
-### Step 1B: Transpose TPM data
-
-To prepare your data for WGCNA, you need to transpose the data so that genes (or other features) become columns and samples become rows. After transposing, the gene_id column will typically be set as the column names.
-
-```{r}
-# Step 1: Remove gene_id and gene_type from the data for transposition
-data_for_transpose <- TPM_transformed %>%
-  dplyr::select(-gene_type)
-
-# Step 2: Transpose the data
-TPM_transposed <- as.data.frame(t(data_for_transpose[,-1]))  # Exclude the first column (gene_id)
-
-# Step 3: Set the column names to the gene_id values
-colnames(TPM_transposed) <- data_for_transpose$gene_id
-```
 
 ### Step 1C: Secondary QC check
 
 The goodSamplesGenes function from the WGCNA package is used to identify and filter out samples and genes that are problematic due to too many missing values or constant expression levels. 
 
 ```{r}
-gsg <- goodSamplesGenes(TPM_transposed)
+#ctf_input <- as.data.frame(t(ctf_filtered_heart))
+ctf_input <- as.data.frame(t(log_ctf))
+gsg <- goodSamplesGenes(ctf_input)
 print(summary(gsg))
 ```
 
@@ -627,7 +673,7 @@ This step involves evaluating a range of powers to find the one that achieves th
 powers <- c(1:20, seq(22, 30, by = 2))
 
 # Step 2: Call the network topology analysis function
-sft <- pickSoftThreshold(TPM_transposed, 
+sft <- pickSoftThreshold(ctf_input, 
                          powerVector = powers, 
                          verbose = 5,
                          networkType = "unsigned") # Option indicates that the network does not distinguish between positive and negative correlations
@@ -644,7 +690,7 @@ style_kable(sft.data, caption ="Soft-Thresholding Power Analysis for WGCNA")
 g1 <- ggplot(sft.data, aes(x = Power, y = SFT.R.sq, label = Power)) +
   geom_point(color = "blue") +
   geom_text_repel(nudge_y = 0.05, color = "red") +
-  geom_hline(yintercept = 0.80, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.90, color = "red", linetype = "dashed") +
   labs(title = "Scale Independence",
        x = "Soft Threshold (power)",
        y = "Scale Free Topology Model Fit, signed R^2") +
@@ -686,7 +732,7 @@ g2 <- ggplot(sft.data, aes(x = Power, y = Mean.Connectivity, label = Power)) +
   )
 
 # Step 5: Save the combined plot as a Cairo PDF on a letter-size page
-CairoPDF(file = "Figures/Figure_S5_WGCNA_Power_Analysis.pdf",
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S5_WGCNA_Power_Analysis.pdf",
          width = 8.5, height = 11)  # Letter size in portrait orientation
 
 # Step 6: Combine and print the two plots onto a single page
@@ -701,20 +747,22 @@ print(combined_plot)
 
 The next step in the WGCNA process is to calculate the Topological Overlap Matrix (TOM) from the given expression data. The TOM is a measure of similarity between genes based on their network connection patterns, which is more robust to noise than direct adjacency measures.
 
+I did this step in an R script because it took a long time (CCVM_Script_scorrelations_1B.R). The output was saved to dissTOM.rds
+
 ```{r TOM similarity matrix}
 # Detect the number of cores on your machine
 numCores <- detectCores() - 2 
 enableWGCNAThreads(numCores)
 
 # Calculate the TOM similarity matrix directly from expression data
-TOM = TOMsimilarityFromExpr(TPM_transposed,
+TOM = TOMsimilarityFromExpr(ctf_input,
                             power = 9,
                             networkType="unsigned", #  specifies that the network does not distinguish between positive and negative correlations.
                             nThreads=numCores)  # specify the number of threads for parallel processing, max 20
 
 # Set row and column names of the TOM matrix to match the gene names
-rownames(TOM) <- colnames(TPM_transposed)
-colnames(TOM) <- colnames(TPM_transposed)
+rownames(TOM) <- colnames(ctf_input)
+colnames(TOM) <- colnames(ctf_input)
 
 # Convert TOM to Dissimilarity
 dissTOM = 1-TOM 
@@ -723,30 +771,32 @@ dissTOM = 1-TOM
 disableWGCNAThreads()
 ```
 
-Note: Depending on your system, different approaches to parallelization may be needed. Function below is an example of an alternative strategy.
+```{r}
+dissTOM <- readRDS("dissTOM_39567genes.rds")
 
-```{r Register parallel backend}
-# library(foreach)
-# library(doParallel)
-# 
-# # Set up a parallel backend. After registering the parallel backend, any code using %dopar% will run in parallel. 
-# # Detect the number of cores on your machine
-# numCores <- detectCores() -1 
-# 
-# # Create a cluster using the available cores
-# cl <- makeCluster(numCores)
-# 
-# # Register the parallel backend
-# registerDoParallel(cl)
-# 
-# # Check that the backend is registered
-# getDoParWorkers()
-# 
-# # stop the cluster after the parallel processing is done:
-# stopCluster(cl)
-# registerDoSEQ()
-# getDoParWorkers()
+#TOM = 1-dissTOM
 ```
+
+
+
+Plot a heatmap
+
+```{r}
+# Base R heatmap
+png("Figures/Audrey_Analysis/Figure_S7_Clustering_of_Module_Eigengenes.png", width = 800, height = 600)
+heatmap(
+  TOM,
+  Rowv = NA,        # Disable row clustering
+  Colv = NA,        # Disable column clustering
+  col = heat.colors(256), # Color palette
+  scale = "none",   # Do not scale values
+  main = "Heatmap of Matrix"
+)
+dev.off()
+```
+
+
+
 
 
 ## STEP 2: Hierarchical Clustering of TOM dissimilarity matrix
@@ -809,7 +859,7 @@ color_guide <- gene_module_assignment %>%
 head(gene_module_assignment)
 
 # Plot the dendrogram with module colors
-CairoPDF(file = "Figures/Figure_S6_WGCNA_Gene_Clustering_TOM_Dissimilarity.pdf",
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S6_WGCNA_Gene_Clustering_TOM_Dissimilarity_39567genes.pdf",
          width = 8.5, height = 11)  # Letter size in landscape orientation
 plotDendroAndColors(geneTree, 
                     dynamicColors, 
@@ -830,7 +880,7 @@ Once modules have been identified using the TOM-based clustering, the moduleEige
 
 ```{r}
 # Calculate module eigengenes
-MEList <- moduleEigengenes(TPM_transposed, colors = dynamicColors)
+MEList <- moduleEigengenes(ctf_input, colors = dynamicColors)
 MEs <- MEList$eigengenes
 ```
 
@@ -894,7 +944,7 @@ If you identify highly similar modules in the dendrogram, you can merge them.
 mergeCutHeight <- 0.1
 
 # Merge similar modules
-mergedModules <- mergeCloseModules(TPM_transposed, 
+mergedModules <- mergeCloseModules(ctf_input, 
                                    dynamicColors, 
                                    cutHeight = mergeCutHeight, 
                                    verbose = 3)
@@ -906,7 +956,7 @@ colnames(mergedMEs) <- substring(colnames(mergedMEs), 3)
 
 # Combine gene IDs with their corresponding module labels
 gene_module_assignment_merged <- tibble(
-  gene_id = colnames(TPM_transposed),        # Gene identifiers from TPM
+  gene_id = colnames(ctf_input),        # Gene identifiers from TPM
   module_color = mergedColors                # Module colors from mergedModules
 )
 
@@ -955,7 +1005,7 @@ plot(FigS7B)
 combined_plot_s7 <- grid.arrange(FigS7A, FigS7B, ncol = 1)
 
 # Save the plot as a high-quality PDF
-ggsave("Figures/Figure_S7_Clustering_of_Module_Eigengenes.pdf", 
+ggsave("Figures/Audrey_Analysis/Figure_S7_Clustering_of_Module_Eigengenes_39567genes.pdf", 
        plot = combined_plot_s7,
        width = 8.5, height = 11, units = "in", dpi = 300, device = cairo_pdf)
 ```
@@ -986,24 +1036,33 @@ color_guide_merged <- tibble(
 Prepare data for functional enrichment analysis by mapping gene identifiers and associating them with their corresponding module colors. The gconvert Function, from the gProfiler toolset, is used to convert gene identifiers. It supports mapping gene IDs from various databases (e.g., Ensembl) to more common gene symbols or other formats.
 
 ```{r}
+
 # Select only the 'gene_id' and 'gene_type' columns from TPM_transformed
-TPM_gene_type <- TPM_transformed %>% dplyr::select(gene_id, gene_type)
+#ctf_gene_type <- gene_counts %>% dplyr::select(ENSG_ID, gene_type) %>%
+#  filter(ENSG_ID %in% rownames(ctf_filtered_heart)) %>%
+#  rename(ensg_id = ENSG_ID)
 
-# Map Gene Identifiers
-gene_table <- gconvert(query=c(gsub("\\..*", "", TPM_gene_type$gene_id)),
-                       organism="hsapiens", target="ENSG", filter_na=FALSE)
+ctf_gene_type <- gene_counts %>% dplyr::select(ENSG_ID, gene_type) %>%
+  filter(ENSG_ID %in% colnames(ctf_input)) %>%
+  rename(ensg_id = ENSG_ID)
 
-# Use cbind to combine the original gene_id with the gene_info data
-gene_info <- as_tibble(cbind(TPM_gene_type, gene_table))
+#ctf_genes <- genes[genes$gene_id %in% rownames(ctf_filtered_heart), c("gene_id", "gene_type")]
+ctf_genes <- genes[genes$gene_id %in% colnames(ctf_input), c("gene_id", "gene_type")]
 
-# Replace NA values in gene names with the input gene identifiers
-gene_info <- gene_info %>%
-  mutate(gene_symbol = coalesce(name, input)) %>%
-  dplyr::select(gene_id, input, gene_symbol, gene_type) %>%
-  dplyr::rename(gene_accession = input)
+
+# Get back the Gene name from the input data. We don't need the counts but just the identifiers
+dir_path <- "InputData"
+
+gene_ensg_map <- read_tsv(
+  file.path(dir_path, "salmon.merged.gene_counts.tsv"),
+  show_col_types = FALSE,
+  col_select = 1:2 
+)
+
 
 # Select relevant columns and bind module color information
-gene_info <- gene_info %>% 
+gene_info <- ctf_genes %>% 
+  left_join(gene_ensg_map, by = "gene_id") %>%
   left_join(gene_module_assignment_merged, by = "gene_id") %>%
   left_join(color_guide_merged, by = "module_color") %>%
   mutate(color_rgb = col2hex(module_color))
@@ -1015,7 +1074,6 @@ The CHDgene website (https://chdgene.victorchang.edu.au) is an online resource c
 
 We will annotate our gene list with the list of 142 known CHD genes downloaded from the CHDgene website.
 
-Note: 141 of the 142 CHD genes are in the TPM data (GDF1 is not)
 
 ```{r}
 # Specify the data directory and file path
@@ -1028,9 +1086,16 @@ file_path <- file.path(dir_path, "chdgene_table.csv")
 chd_gene_list <- read_csv(file_path, show_col_types = FALSE) %>%
   pull(Gene)
 
+# 140 genes overlap
+length(intersect(gene_info$gene_name, chd_gene_list))
+# "NODAL" "ZIC3" are not in our results genes
+setdiff(chd_gene_list, gene_info$gene_name)
+
+
 # Add column for CHD gene to gene_info table
 gene_info <- gene_info %>% 
-  mutate(chd_gene = gene_symbol %in% chd_gene_list)
+  mutate(chd_gene = gene_name %in% chd_gene_list) %>%
+  rename(gene_symbol = gene_name)
 
 # Display the first few rows of the gene_info data frame
 head(gene_info %>% filter(str_detect(gene_id, "^ENSG")))
@@ -1055,7 +1120,7 @@ geneCounts <- gene_info %>%
   summarise(
     num_genes = n(),
     lncRNA_count = sum(gene_type == "lncRNA"),
-    protein_count = sum(gene_type == "protein"),
+    protein_count = sum(gene_type == "protein_coding"),
     chd_gene_count = sum(chd_gene == TRUE)
   )
 
@@ -1230,6 +1295,8 @@ head(merged_results_organ)
 
 # Save the merged results to the supplemental tables list
 supplementalTables$TableS2 <- merged_results_organ
+
+write.csv(moduleTraitCor, "moduleTraitCor_39567genes.csv")
 ```
 
 ### Step 3C: Visualization of organ eigengene module heatmap
@@ -1260,7 +1327,7 @@ rownames(textMatrix) <- rownames(moduleTraitCor)  # Module names (e.g., from MEs
 colnames(textMatrix) <- colnames(moduleTraitCor)  # Organ names (e.g., from traitData)
 
 # Step 3: Open a Cairo PDF device with a defined page size
-CairoPDF(file = "Figures/Figure_3_Module_Organ_Relationships.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_3_Module_Organ_Relationships_39567genes.pdf", 
          width = 8.5, height = 11)
 
 # Set the margins in inches using par(mar = ...)
@@ -1310,7 +1377,7 @@ organMEs <- cbind(traitData, MEs_ordered)
 METorgans <- orderMEs(organMEs)
 
 # Plot the eigengene dendrogram
-CairoPDF(file = "Figures/Figure_S8_Module_Organ_Eigengene_Dendrogram.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S8_Module_Organ_Eigengene_Dendrogram_39567genes.pdf", 
          width = 11, height = 8.5)
 par(mar = c(5, 5, 5, 5))  # mar = c(bottom, left, top, right) 
 par(cex = 1.0)  # Set the character expansion for the plot
@@ -1320,7 +1387,7 @@ plotEigengeneNetworks(METorgans, "Eigengene Dendrogram",
 dev.off()
 
 # Plot the eigengene adjacency heatmap
-CairoPDF(file = "Figures/Figure_S9_Module_Organ_Eigengene_Adjacency_heatmap.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S9_Module_Organ_Eigengene_Adjacency_heatmap_39567genes.pdf", 
          width = 8.5, height = 8.5)
 par(mar = c(5, 10, 5, 5))  # mar = c(bottom, left, top, right) 
 par(cex = 1.0)
@@ -1333,6 +1400,18 @@ dev.off()
 >*Supplemental Figure 8: Module Eigengene Dendrogram for Organ-Specific Modules.* This dendrogram illustrates the hierarchical clustering of module eigengenes across different organs. Each branch represents a module eigengene, and the clustering reflects the similarity in expression patterns between the modules. Modules that are closely related are grouped together on the dendrogram, indicating that they have similar expression profiles across the organs. This visualization helps to identify which modules are most closely associated with each other, and to which organs (bold), providing insights into potential shared biological functions or co-regulated gene sets across different tissues. The clustering of the magenta module (ME03) and the heart is highlighted by color.
 
 >*Supplemental Figure 9: Module Eigengene Adjacency Heatmap for Organ-Specific Modules.* This heatmap displays the pairwise correlations between module eigengenes across different organs, with color intensity reflecting the strength and direction of the correlation. Positive correlations are shown in red, indicating that the modules have similar expression patterns, while negative correlations are shown in blue, indicating opposing expression patterns. The heatmap allows for a visual comparison of how closely related the modules are regarding their expression across various organs, highlighting potential tissue-specific modules or those co-expressed in multiple tissues.
+
+
+```{r}
+# Save gene_info
+write.csv(
+  gene_info,                         # Your data frame
+  file = "gene_info_module_results_39567genes.csv",
+  row.names = FALSE
+)
+
+```
+
 
 
 ## STEP 4: Identify Modules Corelated to Heart
@@ -1411,7 +1490,7 @@ rownames(textMatrix) <- rownames(moduleHeartCor)  # Module names (e.g., from MEs
 colnames(textMatrix) <- colnames(moduleHeartCor)  # Organ names (e.g., from traitData)
 
 # Step 3: Open a Cairo PDF device with a defined page size
-CairoPDF(file = "Figures/Figure_S10_Module_Heart_Relationships.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S10_Module_Heart_Relationships_39567genes.pdf", 
          width = 5, height = 11.5)
 par(mar = c(5, 10, 5, 5))  # mar = c(bottom, left, top, right) 
 
@@ -1455,7 +1534,7 @@ heartMEs <- cbind(Heart.dat, MEs_ordered)
 METheart <- orderMEs(heartMEs)
 
 # Plot the eigengene dendrogram
-CairoPDF(file = "Figures/Figure_S11_Module_Heart_Eigengene_Dendrogram.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S11_Module_Heart_Eigengene_Dendrogram_39567genes.pdf", 
          width = 11, height = 8.5)
 par(mar = c(5, 5, 5, 5))  # mar = c(bottom, left, top, right) 
 par(cex = 1.0)  # Set the character expansion for the plot
@@ -1464,7 +1543,7 @@ plotEigengeneNetworks(METheart, "Eigengene Dendrogram", marDendro = c(0, 4, 2, 0
 dev.off()
 
 # Plot the eigengene adjacency heatmap
-CairoPDF(file = "Figures/Figure_S12_Module_Heart_Eigengene_Adjacency_heatmap.pdf", 
+CairoPDF(file = "Figures/Audrey_Analysis/Figure_S12_Module_Heart_Eigengene_Adjacency_heatmap_39567genes.pdf", 
          width = 8.5, height = 8.5)
 par(mar = c(5, 10, 5, 5))  # mar = c(bottom, left, top, right) 
 par(cex = 1.0)
@@ -1493,7 +1572,7 @@ heart_samples <- TPM_metadata %>% filter(Organ == "heart") %>% pull(Sample)
 
 # Subset mergedMEs and Age_in_Weeks to include only the heart samples
 heart_MEs <- mergedMEs[heart_samples, ]
-heart_Age <- stageData[heart_samples, , drop = FALSE]
+heart_Age <- stageData[match(heart_samples, rownames(stageData)), , drop = FALSE]
 ```
 
 ### Step 5B: Correlate Module Eigengenes with Age in Heart Samples
@@ -1674,12 +1753,12 @@ dev.off()
 
 ```{r}
 # Check if the row names of Heart.dat and TPM_transposed match and are in the same order
-if (!identical(rownames(Heart.dat), rownames(TPM_transposed))) {
+if (!identical(rownames(Heart.dat), rownames(ctf_input))) {
   stop("The row names (sample identifiers) of MEs_ordered and traitData do not match or are not in the same order.")
 }
 
 # Calculate gene module membership and p-values
-geneHeartCor <- WGCNA::cor(TPM_transposed, Heart.dat, use = "p")
+geneHeartCor <- WGCNA::cor(ctf_input, Heart.dat, use = "p")
 geneHeartPvalue <- corPvalueStudent(geneHeartCor, nrow(Heart.dat))
 
 # Convert to tibbles and renames columns
@@ -1699,12 +1778,12 @@ geneHeartPvalue <- geneHeartPvalue %>%
 
 ```{r}
 # Check if the row names of mergedMEs and TPM_transposed match and are in the same order
-if (!identical(rownames(mergedMEs), rownames(TPM_transposed))) {
+if (!identical(rownames(mergedMEs), rownames(ctf_input))) {
   stop("The row names (sample identifiers) of MEs_ordered and traitData do not match or are not in the same order.")
 }
 
 # Calculate gene module membership and p-values
-geneModuleMembershipCor <- WGCNA::cor(TPM_transposed, mergedMEs, use = "p")
+geneModuleMembershipCor <- WGCNA::cor(ctf_input, mergedMEs, use = "p")
 geneModuleMembershipPvalue <- corPvalueStudent(geneModuleMembershipCor, nrow(mergedMEs))
 
 # Convert to tibbles and renames columns
@@ -1764,7 +1843,7 @@ Consolidates all relevant gene information into a single data frame for easier a
 
 ```{r}
 # Join the geneTraitSignificance and GSPvalue to gene_info
-gene_info_combined <- gene_info_combined %>%
+gene_info_combined <- gene_info %>%
   left_join(geneHeartCor, by = "gene_id") %>%
   left_join(geneHeartPvalue, by = "gene_id") %>%
   left_join(geneModuleMembershipCor, by = "gene_id") %>%
@@ -1773,6 +1852,16 @@ gene_info_combined <- gene_info_combined %>%
 # Save the merged results to the supplemental data table
 supplementalTables$TableS5 <- gene_info_combined
 ```
+
+
+```{r}
+write.csv(
+  gene_info_combined,                         # Your data frame
+  file = "gene_info_module_results_cutoff_39567genes.csv",
+  row.names = FALSE
+)
+```
+
 
 
 ## STEP 7: Final Analysis
@@ -1789,7 +1878,7 @@ Plots will be created to visualize the hub genes within each module.
 ### Step 7A: Plot Average Eigene Expression
 
 ```{r}
-plot_eigengenes <- function(MEs_ordered, TPM_metadata_heart,
+plot_eigengenes <- function(MEs_ordered, ctf_input,
                             module, figureName = "Figure") {
 
   # Merge MEs and metadata
@@ -1848,7 +1937,7 @@ plot_eigengenes <- function(MEs_ordered, TPM_metadata_heart,
              vjust = 1.5, angle = 90, color = "gray")
 
   # Save the plot
-  ggsave(paste0("Figures/", figureName, "_", module, 
+  ggsave(paste0("Figures/Audrey_Analysis", figureName, "_", module, 
               "_Module_Average_Eigengene_Expression.pdf"), 
        plot = p,
        width = 8.5, height = 6, units = "in", dpi = 300, device = cairo_pdf)
